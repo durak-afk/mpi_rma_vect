@@ -7,6 +7,11 @@
 
 using namespace std;
 
+// Tags pour les communications
+#define TAG_TRAVAIL   1  // leader envoie un vecteur à traiter
+#define TAG_RESULTAT  2  // follower renvoie le résultat
+#define TAG_FIN       3  // leader signale qu'il n'y a plus de travail
+
 int main(int argc, char **argv) {
 
     // Pour initialiser l'environnement MPI avec la possibilité d'utiliser des threads (OpenMP)
@@ -36,6 +41,7 @@ int main(int argc, char **argv) {
 
     int *matrice  = new int[n * n];
     int *vecteurs = nullptr;
+    int *resultats = nullptr;
 
     fstream f;
     if (pid == root) {
@@ -64,69 +70,102 @@ int main(int argc, char **argv) {
                 f << vecteurs[i * n + j] << " ";
             f << endl;
         }
+
+        resultats = new int[m * n];
     }
 
     // ----------------------------------------------------
-    // --- RMA 
-    
+
+    // Diffusion de la matrice à tous les processus (nécessaire pour les calculs)
+    MPI_Bcast(matrice, n * n, MPI_INT, root, MPI_COMM_WORLD);
+
     if (pid == root)
         debut = chrono::system_clock::now();
 
-    MPI_Win win_matrice;
-    MPI_Win_create(matrice, n * n * sizeof(int), sizeof(int),
-                   MPI_INFO_NULL, MPI_COMM_WORLD, &win_matrice);
+    // LEADER 
 
-    MPI_Win_fence(0, win_matrice);
-    if (pid != root) {
-        MPI_Get(matrice, n * n, MPI_INT,
-                root, 0, n * n, MPI_INT, win_matrice);
-    }
-    MPI_Win_fence(0, win_matrice);
-    MPI_Win_free(&win_matrice);
-
-
-
-    int vecteurs_par_proc = m / nprocs;
-    int *vecteurs_locaux  = new int[vecteurs_par_proc * n];
-
-    MPI_Win win_vecteurs;
-    MPI_Win_create(vecteurs, (pid == root ? m * n : 0) * sizeof(int), sizeof(int),
-                   MPI_INFO_NULL, MPI_COMM_WORLD, &win_vecteurs);
-
-    MPI_Win_fence(0, win_vecteurs);
-    MPI_Get(vecteurs_locaux, vecteurs_par_proc * n, MPI_INT,
-            root, pid * vecteurs_par_proc * n,
-            vecteurs_par_proc * n, MPI_INT, win_vecteurs);
-    MPI_Win_fence(0, win_vecteurs);
-    MPI_Win_free(&win_vecteurs);
-
-    // Calcul local des produits matrice-vecteur (OpenMP dans matrice_vecteur)
-    int *resultats_locaux = new int[vecteurs_par_proc * n];
-    for (int i = 0; i < vecteurs_par_proc; i++) {
-        matrice_vecteur(n, matrice, vecteurs_locaux + i * n, resultats_locaux + i * n);
-    }
-
-    int *resultats = nullptr;
-    if (pid == root)
-        resultats = new int[m * n];
-
-    MPI_Win win_resultats;
-    MPI_Win_create(resultats, (pid == root ? m * n : 0) * sizeof(int), sizeof(int),
-                   MPI_INFO_NULL, MPI_COMM_WORLD, &win_resultats);
-
-    MPI_Win_fence(0, win_resultats);
-    MPI_Put(resultats_locaux, vecteurs_par_proc * n, MPI_INT,
-            root, pid * vecteurs_par_proc * n,
-            vecteurs_par_proc * n, MPI_INT, win_resultats);
-    MPI_Win_fence(0, win_resultats);
-    MPI_Win_free(&win_resultats);
-
-    // Dans le temps écoulé on ne s'occupe que de la partie communications et calculs
-    // (on oublie la génération des données et l'écriture des résultats sur le fichier de sortie)
     if (pid == root) {
+
+        int prochain_vecteur = 0; // index du prochain vecteur à distribuer
+        int calculs_restants  = m; // nombre de résultats encore attendus
+
+        for (int dest = 0; dest < nprocs; dest++) {
+            if (dest == root) continue; // root ne se traite pas lui-même
+            if (prochain_vecteur < m) {
+                MPI_Send(&prochain_vecteur, 1, MPI_INT,
+                         dest, TAG_TRAVAIL, MPI_COMM_WORLD);
+                MPI_Send(vecteurs + prochain_vecteur * n, n, MPI_INT,
+                         dest, TAG_TRAVAIL, MPI_COMM_WORLD);
+                prochain_vecteur++;
+            } else {
+
+                MPI_Send(&prochain_vecteur, 1, MPI_INT,
+                         dest, TAG_FIN, MPI_COMM_WORLD);
+            }
+        }
+
+
+        while (calculs_restants > 0) {
+            MPI_Status status;
+            int index_resultat;
+
+
+            MPI_Recv(&index_resultat, 1, MPI_INT,
+                     MPI_ANY_SOURCE, TAG_RESULTAT, MPI_COMM_WORLD, &status);
+
+            MPI_Recv(resultats + index_resultat * n, n, MPI_INT,
+                     status.MPI_SOURCE, TAG_RESULTAT, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            calculs_restants--;
+
+            if (prochain_vecteur < m) {
+                MPI_Send(&prochain_vecteur, 1, MPI_INT,
+                         status.MPI_SOURCE, TAG_TRAVAIL, MPI_COMM_WORLD);
+                MPI_Send(vecteurs + prochain_vecteur * n, n, MPI_INT,
+                         status.MPI_SOURCE, TAG_TRAVAIL, MPI_COMM_WORLD);
+                prochain_vecteur++;
+            } else {
+                MPI_Send(&prochain_vecteur, 1, MPI_INT,
+                         status.MPI_SOURCE, TAG_FIN, MPI_COMM_WORLD);
+            }
+        }
+
         fin = chrono::system_clock::now();
         chrono::duration<double> elapsed_seconds = fin - debut;
         cout << "temps en secondes : " << elapsed_seconds.count() << endl;
+
+
+    // FOLLOWERS 
+    } else {
+
+        int *vecteur_local   = new int[n];
+        int *resultat_local  = new int[n];
+
+        // Les followers connaissent m 
+        while (true) {
+            MPI_Status status;
+            int index_vecteur;
+
+            MPI_Recv(&index_vecteur, 1, MPI_INT,
+                     root, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+            // Si le leader signale la fin, on arrête
+            if (status.MPI_TAG == TAG_FIN)
+                break;
+
+            MPI_Recv(vecteur_local, n, MPI_INT,
+                     root, TAG_TRAVAIL, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+
+            matrice_vecteur(n, matrice, vecteur_local, resultat_local);
+
+            MPI_Send(&index_vecteur, 1, MPI_INT,
+                     root, TAG_RESULTAT, MPI_COMM_WORLD);
+            MPI_Send(resultat_local, n, MPI_INT,
+                     root, TAG_RESULTAT, MPI_COMM_WORLD);
+        }
+
+        delete[] vecteur_local;
+        delete[] resultat_local;
     }
 
     // ----------------------------------------------------
