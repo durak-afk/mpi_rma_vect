@@ -1,18 +1,21 @@
 MPICXX = mpic++
-SRC= $(wildcard *.cpp)
-OBJ= $(SRC:.cpp=.o)
-EXEC= main
+FLAGS = -fopenmp
+BLAS_INC = -I/opt/OpenBLAS/include
+BLAS_LIB = -L/opt/OpenBLAS/lib -lopenblas -Wl,-rpath,/opt/OpenBLAS/lib
 
-%.o :%.cpp
-	$(MPICXX) -o $@ -c $< -fopenmp
+all: main_blas2
 
-main : $(OBJ) 
-	$(MPICXX) -o $@ $^ -fopenmp
+fonctions.o: fonctions.cpp
+	$(MPICXX) -c $< $(FLAGS)
 
-.PHONY: clean mrproper
+main.o: main.cpp
+	$(MPICXX) -c $< $(FLAGS) $(BLAS_INC)
+
+main_blas2: main.o fonctions.o
+	$(MPICXX) -o $@ $^ $(FLAGS) $(BLAS_LIB)
 
 clean:
-	@rm -rf *.o
+	rm -f *.o
 
 mrproper: clean
-	@rm -rf $(EXEC)
+	rm -f main_blas2
