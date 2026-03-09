@@ -1,4 +1,4 @@
-# mpi_rma_vect
+# Version 0
 
 
 Pour lancer :
